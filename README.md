@@ -156,7 +156,9 @@ domains created via either the new or legacy API are tagged.
 ## Prerequisite
 
 1. A machine to deploy CDK code, with AWS credentials configured.
-2. Python 3.8+ and Node.js installed.
+2. Python 3.10+ and Node.js installed. Deploying on its own works on 3.9
+   (cdk-nag's floor), but the pinned pytest in `requirements-dev.txt` needs
+   3.10+, so 3.10 is the practical minimum.
 
 ## To deploy
 
