@@ -3,6 +3,9 @@
 import boto3
 import os
 import json
+import time
+
+from botocore.exceptions import ClientError
 
 def aws_ec2(event):
     arnList = []
@@ -154,6 +157,49 @@ def aws_logs(event):
     # dont need to get ARN for aws logs.
     return arnList
 
+def aws_kafka(event):
+    """Amazon MSK. A cluster stays CREATING for 15-30 minutes, but
+    kafka:TagResource accepts the ARN immediately, so no polling is needed.
+    CreateCluster (v1) and CreateClusterV2 both return responseElements.clusterArn.
+    """
+    arnList = []
+    if event['detail']['eventName'] in ('CreateCluster', 'CreateClusterV2'):
+        print("tagging for new MSK cluster...")
+        response = event['detail']['responseElements'] or {}
+        arn = response.get('clusterArn')
+        if arn:
+            arnList.append(arn)
+    return arnList
+
+def aws_eks(event):
+    """Amazon EKS. Like MSK, eks:TagResource works on a CREATING cluster ARN."""
+    arnList = []
+    if event['detail']['eventName'] == 'CreateCluster':
+        print("tagging for new EKS cluster...")
+        response = event['detail']['responseElements'] or {}
+        arn = (response.get('cluster') or {}).get('arn')
+        if arn:
+            arnList.append(arn)
+    return arnList
+
+def aws_ecs(event):
+    """Amazon ECS clusters and services. Both are taggable as soon as they are
+    created; only the service has a brief eventual-consistency window."""
+    arnList = []
+    response = event['detail']['responseElements'] or {}
+    eventName = event['detail']['eventName']
+    if eventName == 'CreateCluster':
+        print("tagging for new ECS cluster...")
+        arn = (response.get('cluster') or {}).get('clusterArn')
+        if arn:
+            arnList.append(arn)
+    elif eventName == 'CreateService':
+        print("tagging for new ECS service...")
+        arn = (response.get('service') or {}).get('serviceArn')
+        if arn:
+            arnList.append(arn)
+    return arnList
+
 # NOTE: ElastiCache (aws.elasticache) is intentionally NOT handled here.
 # A cache cluster / replication group / serverless cache can take a long time
 # to provision, especially during batch creation, and rejects tagging until it
@@ -162,6 +208,11 @@ def aws_logs(event):
 # asynchronously by a dedicated Step Functions workflow that polls Describe*
 # until Status == available, then calls AddTagsToResource. See the CDK stack
 # (PART 4) and lambda/elasticache_tagging.py.
+#
+# Summary of what this Lambda does NOT tag, and where it happens instead:
+#   - RDS / Aurora / DocumentDB -> RDS service-event Lambda   (PART 3)
+#   - OpenSearch                -> Step Functions workflow    (PART 2)
+#   - ElastiCache (incl. Serverless) -> Step Functions workflow (PART 4)
 
 def get_identity(event):
     print("getting user Identity...")
@@ -171,6 +222,35 @@ def get_identity(event):
         _roleId = event['detail']['userIdentity']['arn'].split('/')[-2]
         return _userId, _roleId
     return _userId
+
+def aws_kinesisanalytics(event):
+    """Amazon Managed Service for Apache Flink (formerly Kinesis Data
+    Analytics). CreateApplication returns a READY application, so it is
+    taggable immediately. The event source is still aws.kinesisanalytics even
+    though the API/boto3 client is the v2 one."""
+    arnList = []
+    if event['detail']['eventName'] == 'CreateApplication':
+        print("tagging for new Managed Service for Apache Flink application...")
+        response = event['detail']['responseElements'] or {}
+        detail = response.get('applicationDetail') or {}
+        arn = detail.get('applicationARN') or response.get('applicationARN')
+        if arn:
+            arnList.append(arn)
+    return arnList
+
+def aws_redshift_serverless(event):
+    """Redshift Serverless *namespace* only. A namespace is AVAILABLE as soon as
+    CreateNamespace returns (it has no CREATING state), so it is tagged here. A
+    *workgroup* takes minutes to provision and has its own Step Functions
+    workflow -- see the CDK stack, PART 7."""
+    arnList = []
+    if event['detail']['eventName'] == 'CreateNamespace':
+        print("tagging for new Redshift Serverless namespace...")
+        response = event['detail']['responseElements'] or {}
+        arn = (response.get('namespace') or {}).get('namespaceArn')
+        if arn:
+            arnList.append(arn)
+    return arnList
 
 # Explicit dispatch table: maps an EventBridge `source` to its handler.
 # Using an allowlisted dict instead of globals()[source] prevents an
@@ -188,6 +268,123 @@ _SOURCE_HANDLERS = {
     "aws.elasticfilesystem": aws_elasticfilesystem,
     "aws.gamelift": aws_gamelift,
     "aws.logs": aws_logs,
+    "aws.kafka": aws_kafka,
+    "aws.eks": aws_eks,
+    "aws.ecs": aws_ecs,
+    "aws.kinesisanalytics": aws_kinesisanalytics,
+    "aws.redshift-serverless": aws_redshift_serverless,
+}
+
+
+def _tag_with_retry(call, retry_error_codes, attempts=5, delay=3):
+    """Run a tag call, retrying only the transient error codes a just-created
+    resource can raise before it is visible to (or settled enough for) its
+    tagging API. Any other error, or the final attempt, propagates."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except ClientError as exc:
+            code = exc.response.get('Error', {}).get('Code')
+            if code not in retry_error_codes or attempt == attempts:
+                raise
+            print(f"tagging attempt {attempt} failed with {code}; "
+                  f"retrying in {delay}s")
+            time.sleep(delay)
+
+
+# A CreateService event can arrive before the service is visible to the tagging
+# API. InvalidParameterException is deliberately NOT retried -- it signals a bad
+# request, so retrying would only stall the invocation.
+_ECS_RETRY_CODES = ("ResourceNotFoundException", "ClusterNotFoundException")
+
+# A brand-new MSF application can still be settling when the event arrives.
+_MSF_RETRY_CODES = ("ResourceInUseException", "ConcurrentModificationException")
+
+
+# Services whose tag API is not reachable through the Resource Groups Tagging
+# API (different parameter names, different tag structure, or tagging by name
+# instead of by ARN) get a native tagger here. Any source not in this table
+# falls back to resourcegroupstaggingapi.tag_resources.
+# Signature: tagger(arn_list, res_tags, event) -> None
+
+
+def _tag_gamelift(arn_list, res_tags, event):
+    client = boto3.client('gamelift')
+    tags = [{'Key': key, 'Value': value} for key, value in res_tags.items()]
+    for arn in arn_list:
+        client.tag_resource(ResourceARN=arn, Tags=tags)
+
+
+def _tag_logs(arn_list, res_tags, event):
+    # CloudWatch Logs is tagged by log group *name*, not by ARN, so arn_list is
+    # unused here (aws_logs returns an empty list by design).
+    if event['detail']['eventName'] == 'CreateLogGroup':
+        print("tagging for new cloudwatch logs...")
+        boto3.client('logs').tag_log_group(
+            logGroupName=event['detail']['requestParameters']['logGroupName'],
+            tags={key: value for key, value in res_tags.items()}
+        )
+
+
+def _tag_kafka(arn_list, res_tags, event):
+    """MSK TagResource takes PascalCase params and a {key: value} tag map."""
+    client = boto3.client('kafka')
+    tags = {str(key): str(value) for key, value in res_tags.items()}
+    for arn in arn_list:
+        client.tag_resource(ResourceArn=arn, Tags=tags)
+
+
+def _tag_eks(arn_list, res_tags, event):
+    """EKS TagResource takes camelCase params and a {key: value} tag map."""
+    client = boto3.client('eks')
+    tags = {str(key): str(value) for key, value in res_tags.items()}
+    for arn in arn_list:
+        client.tag_resource(resourceArn=arn, tags=tags)
+
+
+def _tag_ecs(arn_list, res_tags, event):
+    """ECS TagResource takes a list of LOWER-case {key, value} objects."""
+    client = boto3.client('ecs')
+    tags = [{'key': str(key), 'value': str(value)}
+            for key, value in res_tags.items()]
+    for arn in arn_list:
+        _tag_with_retry(
+            lambda: client.tag_resource(resourceArn=arn, tags=tags),
+            _ECS_RETRY_CODES)
+
+
+def _tag_kinesisanalytics(arn_list, res_tags, event):
+    """MSF TagResource takes a list of UPPER-case {Key, Value} objects, and its
+    ARN parameter is ResourceARN (not ResourceArn)."""
+    client = boto3.client('kinesisanalyticsv2')
+    tags = [{'Key': str(key), 'Value': str(value)}
+            for key, value in res_tags.items()]
+    for arn in arn_list:
+        _tag_with_retry(
+            lambda: client.tag_resource(ResourceARN=arn, Tags=tags),
+            _MSF_RETRY_CODES)
+
+
+def _tag_redshift_serverless(arn_list, res_tags, event):
+    """Redshift Serverless TagResource takes camelCase params and a list of
+    LOWER-case {key, value} objects. Note the Step Functions path (PART 7) uses
+    the PascalCase SDK-integration spelling instead -- do not copy this shape
+    into the state machine."""
+    client = boto3.client('redshift-serverless')
+    tags = [{'key': str(key), 'value': str(value)}
+            for key, value in res_tags.items()]
+    for arn in arn_list:
+        client.tag_resource(resourceArn=arn, tags=tags)
+
+
+_NATIVE_TAGGERS = {
+    "aws.gamelift": _tag_gamelift,
+    "aws.logs": _tag_logs,
+    "aws.kafka": _tag_kafka,
+    "aws.eks": _tag_eks,
+    "aws.ecs": _tag_ecs,
+    "aws.kinesisanalytics": _tag_kinesisanalytics,
+    "aws.redshift-serverless": _tag_redshift_serverless,
 }
 
 
@@ -195,12 +392,12 @@ def main(event, context):
     print(f"input event is: {event}")
     print("new source is ", event['source'])
     _source = event['source']
-    _method = _source.replace('.', "_")
 
     handler = _SOURCE_HANDLERS.get(_source)
     if handler is None:
         raise ValueError(f"Unsupported event source: {_source}")
-    resARNs = handler(event)
+    # A handler returns None when the eventName is one it does not act on.
+    resARNs = handler(event) or []
     print("resource arn is: ", resARNs)
 
     _res_tags =  json.loads(os.environ['tags'])
@@ -217,36 +414,20 @@ def main(event, context):
     
     print(_res_tags)
 
-    # GameLift
-    if _method == 'aws_gamelift':
-        client = boto3.client('gamelift')
-        tags = [{'Key': key, 'Value': value} for key, value in _res_tags.items()]
-        for arn in resARNs:
-            response = client.tag_resource(
-                ResourceARN=arn,
-                Tags=tags
-            )
-    if _method == 'aws_logs':
-        client = boto3.client('logs')
-        # Convert list of key-value pairs to dictionary for CloudWatch Logs
-        tags = {key: value for key, value in _res_tags.items()}
-        if event['detail']['eventName'] == 'CreateLogGroup':
-            print("tagging for new cloudwatch logs...")
-            _logGroupName = event['detail']['requestParameters']['logGroupName']
-            response = client.tag_log_group(
-                logGroupName=_logGroupName,
-                tags=tags
-            )
-    # NOTE: RDS/DocumentDB and ElastiCache (incl. Serverless) are no longer
-    # tagged from this Lambda. They are handled asynchronously once the
-    # resource is available -- RDS/Aurora via the RDS service-event Lambda
-    # (PART 3) and ElastiCache via a Step Functions workflow (PART 4).
-
-    else:
+    # Services with their own tag API go through _NATIVE_TAGGERS; everything
+    # else is tagged generically. This used to be an if/if/else chain whose
+    # else bound only to the last if, so GameLift was tagged twice -- natively
+    # and then again through the Resource Groups Tagging API.
+    tagger = _NATIVE_TAGGERS.get(_source)
+    if tagger is not None:
+        tagger(resARNs, _res_tags, event)
+    elif resARNs:
         boto3.client('resourcegroupstaggingapi').tag_resources(
             ResourceARNList=resARNs,
             Tags=_res_tags
         )
+    else:
+        print(f"no ARNs resolved for source {_source}; nothing to tag")
 
     return {
         'statusCode': 200,

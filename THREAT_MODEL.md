@@ -12,12 +12,15 @@ account/region where it is deployed. Three trigger paths:
 
 1. **Synchronous tagging (generic services)** — Amazon EventBridge matches
    CloudTrail `Create*` events for EC2, S3, Lambda, DynamoDB, ELB, EFS, SQS,
-   SNS, KMS, GameLift, CloudWatch Logs → invokes a Lambda that tags the
-   resource immediately.
+   SNS, KMS, GameLift, CloudWatch Logs, MSK, EKS, ECS (cluster + service),
+   Managed Service for Apache Flink, and Redshift Serverless namespaces →
+   invokes a Lambda that tags the resource immediately.
 2. **Polling tagging (slow to provision)** — EventBridge matches OpenSearch
-   (`aws.es`) and ElastiCache (`aws.elasticache`) create events → starts a Step
-   Functions state machine that polls `Describe*` until the resource is
-   `available`/not `Processing`, then applies tags.
+   (`aws.es`), ElastiCache (`aws.elasticache`), Kinesis Data Streams
+   (`aws.kinesis`), Redshift (`aws.redshift`), and Redshift Serverless
+   workgroups (`aws.redshift-serverless` / `CreateWorkgroup`) create events →
+   starts a Step Functions state machine that polls `Describe*`/`Get*` until the
+   resource is ready, then applies tags.
 3. **Service-event tagging (RDS/Aurora)** — EventBridge matches the native RDS
    service events `RDS-EVENT-0170` / `RDS-EVENT-0005` → invokes a Lambda that
    tags `detail.SourceArn`.
@@ -35,7 +38,7 @@ CloudTrail / RDS service events (AWS-internal, trusted)
         │                                              AWS-emitted events match
    ┌────┴───────────────┬──────────────────┐
  Lambda            Step Functions       Lambda
- (generic tag)     (OS / EC poll+tag)   (RDS tag)
+ (generic tag)     (5 poll+tag flows)   (RDS tag)
         │                │                  │
    tagging APIs on the account's own resources (same account, same region)
 ```
@@ -59,11 +62,11 @@ CloudTrail / RDS service events (AWS-internal, trusted)
 
 | # | Threat (STRIDE) | Mitigation |
 |---|---|---|
-| T1 | **Elevation / over-broad IAM** — Lambda roles use `resources=["*"]` | **Inherent & justified**: the automation must tag resources whose ARNs are unknown at deploy time (any future resource). Actions are scoped to **tag-write + read-only `Describe*`/`Get*Tagging`/`List*Tags` only** — no create/delete/modify of data or infra, and (after T8) no tag-removal. The granted action set is exactly what the handler code exercises. Each trigger path has its **own least-privilege role** (generic / RDS / OpenSearch / ElastiCache split), so a fault in one path cannot tag-API another service set. |
+| T1 | **Elevation / over-broad IAM** — Lambda roles use `resources=["*"]` | **Inherent & justified**: the automation must tag resources whose ARNs are unknown at deploy time (any future resource). Actions are scoped to **tag-write + read-only `Describe*`/`Get*Tagging`/`List*Tags` only** — no create/delete/modify of data or infra, and (after T8) no tag-removal. The granted action set is exactly what the handler code exercises. Each trigger path has its **own least-privilege role** (generic / RDS / OpenSearch / ElastiCache / Kinesis / Redshift / Redshift Serverless split), so a fault in one path cannot tag-API another service set. |
 | T2 | **Wildcard action** `resource-groups:*` in the generic role | **Remediation: removed.** The code only calls `resourcegroupstaggingapi.tag_resources` (= `tag:TagResources`, already granted). The unused `resource-groups:*` wildcard was deleted. |
 | T3 | **Tampering via spoofed events** | EventBridge rules match only AWS-native `source`/`detail-type`/`eventName`; events are produced by CloudTrail/RDS, not externally injectable. No public ingress. |
 | T4 | **Info disclosure via identity recording** | Off by default (`identityRecording=false`). When on, it records only principal IDs (`userId`/`roleId`) as tags — no credentials/secrets. Documented in README. |
-| T5 | **DoS / runaway polling** | Step Functions executions have a 2-hour `timeout`; `Describe*` calls use bounded retries with backoff + jitter; first ElastiCache poll is randomized 60–120s to spread `Describe*` across a batch. |
+| T5 | **DoS / runaway polling** | Step Functions executions have a 2-hour `timeout`; `Describe*`/`Get*` calls use bounded retries with backoff + full jitter; the retry wait is randomized per execution (60–120s, or 15–45s for Kinesis, which normally goes ACTIVE within seconds) to spread describe calls across a batch. The two in-Lambda retries (ECS service, MSF application) are bounded at 5 attempts × 3s and only fire on named eventual-consistency error codes. |
 | T6 | **Logging exposure** | State machine logs go to a dedicated CloudWatch Log group with 1-month retention; logs contain resource IDs/ARNs and tag keys/values only (no secrets). |
 | T7 | **Repudiation** | All actions are CloudTrail-logged under the function's role; Step Functions execution history retained. |
 | T8 | **Unused / mutating grants in the generic role** — the policy granted `tag:UntagResources`, `cloudformation:DescribeStacks`, `cloudformation:ListStackResources`, `ec2:DescribeNatGateways`, `ec2:DescribeInternetGateways`, none of which any handler calls | **Remediation: removed.** Verified by code review that no Lambda path invokes them; `tag:UntagResources` is *mutating* (can strip tags) and contradicted the "no modify" scope in T1. Removing them makes the granted policy exactly equal to what the code exercises. The retained reads (`ec2:DescribeVolumes`, `dynamodb:DescribeTable`, S3/SQS/KMS/EFS `Get*Tagging`/`List*Tags`) are required by the Resource Groups Tagging API / boto3 waiters and were kept. |
@@ -103,7 +106,7 @@ or justified; the 2026-06-23 rescan above confirms they no longer appear.
 |---|---|---|---|
 | `globals()` dynamic dispatch | semgrep / WARNING (`dangerous-globals-use`) | `lambda/lambda-handler.py` | **Fixed.** Replaced `globals()[source]` with an allowlisted dispatch dict (`_SOURCE_HANDLERS`); unknown sources are rejected. Defense-in-depth for T3. |
 | Non-crypto PRNG | bandit / INFO (`B311`) | `lambda/elasticache_tagging.py` | **Justified (false positive).** `random.randint` is polling jitter (T5), not security/crypto. Annotated `# nosec B311`. |
-| cdk_nag not in use | cdk_nag / ERROR | CDK app | **Fixed.** Added `AwsSolutionsChecks` aspect in `app.py` + `cdk-nag` dependency. `cdk synth` now runs clean (0 unsuppressed findings). |
+| cdk_nag not in use | cdk_nag / ERROR | CDK app | **Fixed.** Added `AwsSolutionsChecks` aspect in `app.py` + `cdk-nag` dependency. `cdk synth` now runs clean (0 unsuppressed findings). A unit test (`test_no_unsuppressed_cdk_nag_findings`) now asserts this on every change, because `App.synth()` alone does not fail on error annotations — only the `cdk synth` CLI reports them. |
 | IAM5 / IAM4 / SF2 (surfaced after enabling cdk_nag) | cdk_nag | IAM roles & state machines | **Resolved + justified.** L1 (old runtime) fixed by bumping all Lambdas to Python 3.13. IAM5 wildcard (tag deploy-time-unknown ARNs, tag/read-only — T1/T8), IAM4 (standard Lambda logging policy), and SF2 (X-Ray = observability, not security) each carry a scoped `NagSuppressions` entry with documented evidence in the stack. |
 
 - [ ] (Optional) Slingshot scan — run if required by the PCSR reviewer; Probe
