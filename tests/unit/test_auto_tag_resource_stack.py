@@ -317,6 +317,7 @@ def test_glue_and_athena_have_their_own_rule():
         "athena.amazonaws.com", "glue.amazonaws.com"]
     for name in ("CreateDatabase", "CreateCrawler", "CreateJob", "CreateTrigger",
                  "CreateWorkflow", "CreateSession",
+                 "CreateMLTransform", "CreateUsageProfile",
                  "CreateWorkGroup", "CreateDataCatalog", "CreateCapacityReservation"):
         assert name in pattern["detail"]["eventName"]
 

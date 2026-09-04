@@ -257,21 +257,40 @@ def aws_kinesisanalytics(event):
 # contradicts the "tag-write plus non-secret reads only" scope in
 # THREAT_MODEL.md T1. A connection is unbilled config, so it is not worth it.
 #
-# Taggable Glue types not covered here, should anyone need them: devEndpoint,
-# mlTransform, registry, schema, blueprint, dataQualityRuleset.
+# Taggable Glue types not covered here, all unbilled, should anyone need them:
+# registry, schema, blueprint, dataQualityRuleset, customEntityType, and the
+# named `catalog/<name>` of the multi-catalog feature (that one also needs a
+# glue:GetCatalog grant, like database needs glue:GetDatabase).
+#
+# devEndpoint is billed but still absent: AWS has retired Glue dev endpoints.
+# The read APIs are switched off service-side (GetDevEndpoint answers
+# "operation is currently disabled", ListDevEndpoints returns InternalFailure)
+# and CreateDevEndpoint accepts only Glue 0.9 and 1.0, both long past end of
+# support. A CreateDevEndpoint branch here could never be reached, let alone
+# verified, so it is left out rather than shipped untestable.
 _GLUE_RESOURCES = {
-    "CreateDatabase":   ("database",
-                         lambda req, res: (req.get('databaseInput') or {}).get('name')),
-    "CreateCrawler":    ("crawler",
-                         lambda req, res: req.get('name')),
-    "CreateJob":        ("job",
-                         lambda req, res: res.get('name') or req.get('name')),
-    "CreateTrigger":    ("trigger",
-                         lambda req, res: res.get('name') or req.get('name')),
-    "CreateWorkflow":   ("workflow",
-                         lambda req, res: res.get('name') or req.get('name')),
-    "CreateSession":    ("session",
-                         lambda req, res: (res.get('session') or {}).get('id') or req.get('id')),
+    "CreateDatabase":    ("database",
+                          lambda req, res: (req.get('databaseInput') or {}).get('name')),
+    "CreateCrawler":     ("crawler",
+                          lambda req, res: req.get('name')),
+    "CreateJob":         ("job",
+                          lambda req, res: res.get('name') or req.get('name')),
+    "CreateTrigger":     ("trigger",
+                          lambda req, res: res.get('name') or req.get('name')),
+    "CreateWorkflow":    ("workflow",
+                          lambda req, res: res.get('name') or req.get('name')),
+    "CreateSession":     ("session",
+                          lambda req, res: (res.get('session') or {}).get('id') or req.get('id')),
+    # An ML transform is addressed by its generated *transform ID*, not by the
+    # name the caller chose -- GetMLTransform takes TransformId and the ARN is
+    # mlTransform/<TransformId>. There is deliberately no fallback to
+    # requestParameters.name: without the ID in the response there is no way to
+    # build a correct ARN, and falling back to the name would silently produce
+    # one that points at nothing.
+    "CreateMLTransform": ("mlTransform",
+                          lambda req, res: res.get('transformId')),
+    "CreateUsageProfile": ("usageProfile",
+                           lambda req, res: res.get('name') or req.get('name')),
 }
 
 

@@ -139,15 +139,41 @@ and it already carries DynamoDB's `CreateTable`. Glue emits `CreateTable` too �
 one per table a crawler discovers — so folding Glue in would invoke the Lambda
 once per discovered table for a resource that cannot be tagged at all.
 
-**What Glue can and cannot tag.** `glue:TagResource` accepts `database`,
-`crawler`, `job`, `trigger`, `workflow`, `session`, `connection`, `devEndpoint`,
-`mlTransform`, `registry`, `schema`, `blueprint`, and `dataQualityRuleset` ARNs.
-It rejects `table`, `tableVersion`, `userDefinedFunction` (all
-`InvalidInputException`) and the root `catalog` (*"Tag operations not supported on
-root catalog"*) — the Data Catalog only supports tags down to the **database**
-level. This solution covers `database`, `crawler`, `job`, `trigger`, `workflow`,
-and `session`; the rest are one line each in `_GLUE_RESOURCES` should you need
-them.
+**What Glue can and cannot tag.** `glue:TagResource` accepts 16 ARN types:
+`database`, `catalog/<name>`, `connection`, `crawler`, `job`, `trigger`,
+`workflow`, `session`, `devEndpoint`, `mlTransform`, `usageProfile`, `registry`,
+`schema`, `blueprint`, `dataQualityRuleset`, and `customEntityType`. It rejects
+`table`, `tableVersion`, `partition`, `column`, `userDefinedFunction`, `jobRun`,
+`crawl`, `classifier`, `securityConfiguration`, `script`, and
+`dataCatalogEncryptionSettings` (all `InvalidInputException`), as well as the
+**root** `catalog` with no name (*"Tag operations not supported on root
+catalog"*) — the Data Catalog only supports tags down to the **database** level.
+
+This solution covers the eight that carry or govern cost and can still be
+created: `database`, `crawler`, `job`, `trigger`, `workflow`, `session`,
+`mlTransform`, and `usageProfile`. All eight, plus all three Athena types, were
+verified end-to-end in `us-east-1`: each resource was created untagged, and the
+tags configured at deploy time appeared on it without any further action.
+
+The unbilled remainder (`registry`, `schema`, `blueprint`,
+`dataQualityRuleset`, `customEntityType`, and the named `catalog`) are one line
+each in `_GLUE_RESOURCES` should you need them; the named `catalog` additionally
+needs a `glue:GetCatalog` grant, for the same reason `database` needs
+`glue:GetDatabase`.
+
+> **An ML transform is addressed by ID, not by name.** Its ARN is
+> `mlTransform/<TransformId>`, using the ID Glue generates, so the handler reads
+> `responseElements.transformId` and deliberately does *not* fall back to the
+> caller's chosen name — that would build an ARN pointing at nothing.
+
+> **Why `devEndpoint` is left out even though it is billed.** AWS has retired
+> Glue dev endpoints. The read APIs are switched off service-side —
+> `GetDevEndpoint` answers *"operation is currently disabled"* and
+> `ListDevEndpoints` returns `InternalFailure` — and `CreateDevEndpoint` accepts
+> only Glue `0.9` and `1.0`, both long past end of support. The CloudTrail event
+> can no longer be produced, so a handler branch for it could never be reached
+> or verified. `tests/unit/test_generic_dispatch.py` asserts the no-op to keep
+> the omission deliberate.
 
 No Glue `Create*` API returns an ARN — most return an empty body and the rest
 return just a name — so the ARN is rebuilt from the event's account and region,
@@ -157,12 +183,11 @@ the same way SNS and SQS are handled.
 makes the service run an internal existence check, so `glue:TagResource` alone
 fails with `AccessDeniedException: not authorized to perform: glue:GetDatabase on
 resource: arn:aws:glue:…:catalog`. The role therefore also carries
-`glue:GetDatabase`, which returns database metadata only. `crawler`, `job`,
-`trigger`, `workflow`, and `session` need nothing beyond `glue:TagResource`.
-
-Every Glue type above and all three Athena types were verified end-to-end in
-`us-east-1`: each resource was created untagged, and the tags configured at
-deploy time appeared on it without any further action.
+`glue:GetDatabase`, which returns database metadata only. Only the three Data
+Catalog *container* types behave this way — `database` needs `glue:GetDatabase`,
+the named `catalog` needs `glue:GetCatalog`, and `connection` needs
+`glue:GetConnection`. The other 13 types need nothing beyond
+`glue:TagResource`.
 
 > **Why Glue connections are out of scope.** A connection's existence check needs
 > `glue:GetConnection`, and `GetConnection` with `HidePassword=false` returns the

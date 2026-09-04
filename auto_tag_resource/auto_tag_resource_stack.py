@@ -135,14 +135,16 @@ class AutoTagResourceStack(Stack):
                             detail={
                                 "eventSource": ["glue.amazonaws.com", "athena.amazonaws.com"],
                                 # Glue: database, crawler, job, trigger,
-                                # workflow, interactive session. Athena:
-                                # workgroup, data catalog, capacity reservation.
+                                # workflow, interactive session, ML transform,
+                                # usage profile. Athena: workgroup, data
+                                # catalog, capacity reservation.
                                 # Note Athena's CreateWork*G*roup is a different
                                 # string from Redshift Serverless's
                                 # CreateWorkgroup (PART 7), so the two rules
                                 # cannot cross over.
                                 "eventName": ["CreateDatabase", "CreateCrawler", "CreateJob",
                                               "CreateTrigger", "CreateWorkflow", "CreateSession",
+                                              "CreateMLTransform", "CreateUsageProfile",
                                               "CreateWorkGroup", "CreateDataCatalog",
                                               "CreateCapacityReservation"],
                                 "errorCode": [{"exists": False}]

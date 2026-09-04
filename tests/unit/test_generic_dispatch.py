@@ -276,6 +276,7 @@ def test_glue_database_arn_is_built_from_the_database_input(fake_boto3):
     ("CreateTrigger", {"name": "my-trigger"}, {}, "trigger/my-trigger"),
     ("CreateWorkflow", {"name": "my-flow"}, {}, "workflow/my-flow"),
     ("CreateSession", {"session": {"id": "sess-1"}}, {}, "session/sess-1"),
+    ("CreateUsageProfile", {"name": "my-profile"}, {}, "usageProfile/my-profile"),
 ])
 def test_glue_resource_types_resolve_their_own_arn(
         fake_boto3, event_name, response, request_params, expected_arn_suffix):
@@ -295,6 +296,40 @@ def test_glue_job_falls_back_to_the_request_name(fake_boto3):
                    {}, {"name": "my-job"})
     lambda_handler.main(event, None)
     assert fake_boto3.calls[0][2]["ResourceArn"].endswith("job/my-job")
+
+
+def test_glue_ml_transform_uses_the_transform_id_not_the_name(fake_boto3):
+    """An ML transform's ARN is mlTransform/<TransformId> -- the generated ID,
+    not the caller's chosen name. Building it from the name would produce an ARN
+    that points at nothing."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateMLTransform",
+                   {"transformId": "tfm-abc123"}, {"name": "my-transform"})
+    lambda_handler.main(event, None)
+
+    assert fake_boto3.calls == [(
+        "glue", "tag_resource",
+        {"ResourceArn": "arn:aws:glue:us-east-2:123456789012:mlTransform/tfm-abc123",
+         "TagsToAdd": {"Team": "platform"}},
+    )]
+
+
+def test_glue_ml_transform_without_an_id_tags_nothing(fake_boto3):
+    """No transform ID means no correct ARN is derivable, so the handler must
+    no-op rather than fall back to the name."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateMLTransform",
+                   {}, {"name": "my-transform"})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls == []
+
+
+def test_glue_dev_endpoint_creation_is_a_no_op(fake_boto3):
+    """devEndpoint is a taggable, billed Glue type that is still left uncovered:
+    AWS has retired dev endpoints, so the event can no longer occur. Asserting
+    the no-op keeps the omission deliberate rather than forgotten."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateDevEndpoint",
+                   {}, {"endpointName": "my-ep"})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls == []
 
 
 def test_glue_table_creation_is_a_no_op(fake_boto3):
