@@ -59,7 +59,14 @@ class AutoTagResourceStack(Stack):
             "logs:PutLogEvents", "tag:getResources", "tag:getTagKeys", "tag:getTagValues", "tag:TagResources",
             "GameLift:TagResource", "logs:TagLogGroup",
             "kafka:TagResource", "eks:TagResource", "ecs:TagResource",
-            "kinesisanalytics:TagResource", "redshift-serverless:TagResource"]
+            "kinesisanalytics:TagResource", "redshift-serverless:TagResource",
+            # glue:GetDatabase is not a handler call: tagging a Data Catalog
+            # database ARN makes Glue run an internal existence check that fails
+            # with AccessDenied on glue:GetDatabase without it. It returns
+            # database metadata only (no secrets). Glue connections are out of
+            # scope for the same reason inverted -- their check needs
+            # glue:GetConnection, which can return a plaintext JDBC password.
+            "glue:TagResource", "glue:GetDatabase", "athena:TagResource"]
         ))
 
         tagging_function = _lambda.Function(self, "resource_tagging_automation_function",
@@ -109,6 +116,40 @@ class AutoTagResourceStack(Stack):
                         )
                     )
         _eventRule.add_target(_targets.LambdaFunction(tagging_function, retry_attempts=2))
+
+        # --- 1.2 Glue and Athena: same Lambda, but their own rule ------------
+        # Glue and Athena are immediate-tagging services, so they could have
+        # joined the rule above -- except that rule ORs one flat eventName list
+        # across every source, and it already carries DynamoDB's "CreateTable".
+        # Glue emits CreateTable too (a crawler emits one per discovered table),
+        # and a Glue table is NOT taggable at all: glue:TagResource rejects a
+        # table/<db>/<table> ARN with InvalidInputException. Folding Glue into
+        # the shared rule would therefore invoke the Lambda once per discovered
+        # table only for it to resolve no ARN and no-op. A separate rule keeps
+        # the eventName list exact, so Glue table creation never fires at all.
+        _glueAthenaRule = _events.Rule(self, "glue-athena-tagging-rule",
+                        rule_name="glue-athena-tagging-rule",
+                        event_pattern=_events.EventPattern(
+                            source=["aws.glue", "aws.athena"],
+                            detail_type=["AWS API Call via CloudTrail"],
+                            detail={
+                                "eventSource": ["glue.amazonaws.com", "athena.amazonaws.com"],
+                                # Glue: database, crawler, job, trigger,
+                                # workflow, interactive session. Athena:
+                                # workgroup, data catalog, capacity reservation.
+                                # Note Athena's CreateWork*G*roup is a different
+                                # string from Redshift Serverless's
+                                # CreateWorkgroup (PART 7), so the two rules
+                                # cannot cross over.
+                                "eventName": ["CreateDatabase", "CreateCrawler", "CreateJob",
+                                              "CreateTrigger", "CreateWorkflow", "CreateSession",
+                                              "CreateWorkGroup", "CreateDataCatalog",
+                                              "CreateCapacityReservation"],
+                                "errorCode": [{"exists": False}]
+                            }
+                        )
+                    )
+        _glueAthenaRule.add_target(_targets.LambdaFunction(tagging_function, retry_attempts=2))
 
         # ==================================================================
         # PART 3: RDS / Aurora tagging from the RDS service event

@@ -256,6 +256,112 @@ def test_redshift_serverless_namespace_tagged_with_lowercase_tag_list(fake_boto3
     )]
 
 
+def test_glue_database_arn_is_built_from_the_database_input(fake_boto3):
+    """No Glue Create* returns an ARN, so it is rebuilt from account/region.
+    Glue's tag parameter is TagsToAdd -- a map, not a Tags list."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateDatabase",
+                   {}, {"databaseInput": {"name": "analytics_db"}})
+    lambda_handler.main(event, None)
+
+    assert fake_boto3.calls == [(
+        "glue", "tag_resource",
+        {"ResourceArn": "arn:aws:glue:us-east-2:123456789012:database/analytics_db",
+         "TagsToAdd": {"Team": "platform"}},
+    )]
+
+
+@pytest.mark.parametrize("event_name,response,request_params,expected_arn_suffix", [
+    ("CreateCrawler", {}, {"name": "my-crawler"}, "crawler/my-crawler"),
+    ("CreateJob", {"name": "my-job"}, {"name": "my-job"}, "job/my-job"),
+    ("CreateTrigger", {"name": "my-trigger"}, {}, "trigger/my-trigger"),
+    ("CreateWorkflow", {"name": "my-flow"}, {}, "workflow/my-flow"),
+    ("CreateSession", {"session": {"id": "sess-1"}}, {}, "session/sess-1"),
+])
+def test_glue_resource_types_resolve_their_own_arn(
+        fake_boto3, event_name, response, request_params, expected_arn_suffix):
+    event = _event("aws.glue", "glue.amazonaws.com", event_name,
+                   response, request_params)
+    lambda_handler.main(event, None)
+
+    assert fake_boto3.calls[0][0] == "glue"
+    assert fake_boto3.calls[0][2]["ResourceArn"] == (
+        "arn:aws:glue:us-east-2:123456789012:" + expected_arn_suffix)
+
+
+def test_glue_job_falls_back_to_the_request_name(fake_boto3):
+    """CreateJob echoes the name in responseElements, but an empty body must
+    still resolve from requestParameters."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateJob",
+                   {}, {"name": "my-job"})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls[0][2]["ResourceArn"].endswith("job/my-job")
+
+
+def test_glue_table_creation_is_a_no_op(fake_boto3):
+    """glue:TagResource rejects a table/<db>/<table> ARN outright
+    (InvalidInputException) -- the Data Catalog only tags down to the database
+    level. A Glue CreateTable event reaching this Lambda must resolve no ARN
+    rather than build one the tag API will refuse."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateTable",
+                   {}, {"databaseName": "analytics_db",
+                        "tableInput": {"name": "events"}})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls == []
+
+
+def test_glue_connection_creation_is_a_no_op(fake_boto3):
+    """Tagging a connection ARN makes Glue run an existence check needing
+    glue:GetConnection, which can return the connection's plaintext PASSWORD.
+    Connections are therefore out of scope -- a CreateConnection event must
+    resolve no ARN so the role never needs that grant."""
+    event = _event("aws.glue", "glue.amazonaws.com", "CreateConnection",
+                   {}, {"connectionInput": {"name": "my-conn"}})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls == []
+
+
+def test_athena_workgroup_tagged_with_uppercase_tag_list(fake_boto3):
+    event = _event("aws.athena", "athena.amazonaws.com", "CreateWorkGroup",
+                   {}, {"name": "analytics-wg"})
+    lambda_handler.main(event, None)
+
+    assert fake_boto3.calls == [(
+        "athena", "tag_resource",
+        {"ResourceARN": "arn:aws:athena:us-east-2:123456789012:workgroup/analytics-wg",
+         "Tags": [{"Key": "Team", "Value": "platform"}]},
+    )]
+
+
+@pytest.mark.parametrize("event_name,expected_arn_suffix", [
+    ("CreateDataCatalog", "datacatalog/my-catalog"),
+    ("CreateCapacityReservation", "capacity-reservation/my-catalog"),
+])
+def test_athena_other_resource_types(fake_boto3, event_name, expected_arn_suffix):
+    event = _event("aws.athena", "athena.amazonaws.com", event_name,
+                   {}, {"name": "my-catalog"})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls[0][2]["ResourceARN"] == (
+        "arn:aws:athena:us-east-2:123456789012:" + expected_arn_suffix)
+
+
+def test_athena_workgroup_casing_is_not_confused_with_redshift_serverless(fake_boto3):
+    """Athena emits CreateWork*G*roup; Redshift Serverless emits CreateWorkgroup.
+    Athena must not act on the Redshift spelling."""
+    event = _event("aws.athena", "athena.amazonaws.com", "CreateWorkgroup",
+                   {}, {"name": "analytics-wg"})
+    lambda_handler.main(event, None)
+    assert fake_boto3.calls == []
+
+
+def test_glue_and_athena_events_without_a_name_tag_nothing(fake_boto3):
+    for source, event_source, event_name in (
+            ("aws.glue", "glue.amazonaws.com", "CreateCrawler"),
+            ("aws.athena", "athena.amazonaws.com", "CreateWorkGroup")):
+        event = _event(source, event_source, event_name, {}, {})
+        lambda_handler.main(event, None)
+    assert fake_boto3.calls == []
+
+
 def test_redshift_serverless_ignores_workgroup_events(fake_boto3):
     """CreateWorkgroup is routed to its own state machine (PART 7); if it ever
     reaches this Lambda it must be a no-op, not a mis-tag."""

@@ -46,12 +46,15 @@ the ARN anyway:
 | EKS cluster | `eks:TagResource` accepts a CREATING cluster ARN |
 | ECS cluster / service | taggable on creation; the service has a short eventual-consistency window, retried in the Lambda |
 | Managed Service for Apache Flink application | `CreateApplication` returns a READY application |
+| Glue database, crawler, job, trigger, workflow, interactive session | Data Catalog / orchestration objects, taggable as soon as `Create*` returns |
+| Athena workgroup, data catalog, capacity reservation | created synchronously |
 | Redshift Serverless **namespace** | AVAILABLE on creation (no CREATING state) — the **workgroup** polls instead |
 
-> Six of these services cannot go through the Resource Groups Tagging API: their
-> tag APIs disagree on parameter casing and tag structure (map vs upper-case
-> `[{Key, Value}]` vs lower-case `[{key, value}]`), so each has a small native
-> tagger in `_NATIVE_TAGGERS`.
+> Eight of these services cannot go through the Resource Groups Tagging API:
+> their tag APIs disagree on parameter casing and tag structure (map vs
+> upper-case `[{Key, Value}]` vs lower-case `[{key, value}]`, and Glue names the
+> parameter `TagsToAdd` rather than `Tags`), so each has a small native tagger in
+> `_NATIVE_TAGGERS`.
 
 > **Why ElastiCache polls instead of using events:** ElastiCache *does* emit
 > `...ProvisioningComplete` / `CreateReplicationGroupComplete` lifecycle
@@ -69,6 +72,7 @@ the ARN anyway:
 | Trigger | Path |
 |---|---|
 | CloudTrail `Create*` for the immediate services | `resource-tagging-automation-rule` → generic Lambda → tag now |
+| CloudTrail Glue / Athena `Create*` | `glue-athena-tagging-rule` → same generic Lambda → tag now |
 | CloudTrail `CreateDomain` / `CreateElasticsearchDomain` | `opensearch-tagging-rule` → OpenSearch state machine |
 | CloudTrail ElastiCache `Create*` | `elasticache-tagging-rule` → ElastiCache state machine |
 | CloudTrail `CreateStream` | `kinesis-tagging-rule` → Kinesis state machine |
@@ -100,6 +104,8 @@ IsReady? --- no --> Wait(jitter) ---+
   EKS, ECS (cluster + service), Managed Service for Apache Flink, and Redshift
   Serverless namespaces. The `aws.es`, `aws.rds`, `aws.elasticache`,
   `aws.kinesis` and `aws.redshift` sources are **not** on this rule.
+- **Glue and Athena** are tagged immediately by that same Lambda, but ride a
+  second rule (`glue-athena-tagging-rule`) — see below for why.
 - **OpenSearch** polls `DescribeDomain` until `Processing == false`, then calls
   `AddTags`.
 - **ElastiCache** (cache cluster, replication group, serverless cache) polls
@@ -123,6 +129,58 @@ IsReady? --- no --> Wait(jitter) ---+
 > no `userIdentity`, so the requester identity cannot be recorded for RDS/Aurora
 > resources. Every other path is triggered by a CloudTrail Create event, which
 > does carry `userIdentity`, so `identityRecording` works there.
+
+## Glue and Athena: immediate tagging on a separate rule
+
+Both services are tagged synchronously by the generic Lambda, but they are
+matched by their own EventBridge rule rather than being folded into the shared
+one. The shared rule ORs a single flat `eventName` list across every `source`,
+and it already carries DynamoDB's `CreateTable`. Glue emits `CreateTable` too —
+one per table a crawler discovers — so folding Glue in would invoke the Lambda
+once per discovered table for a resource that cannot be tagged at all.
+
+**What Glue can and cannot tag.** `glue:TagResource` accepts `database`,
+`crawler`, `job`, `trigger`, `workflow`, `session`, `connection`, `devEndpoint`,
+`mlTransform`, `registry`, `schema`, `blueprint`, and `dataQualityRuleset` ARNs.
+It rejects `table`, `tableVersion`, `userDefinedFunction` (all
+`InvalidInputException`) and the root `catalog` (*"Tag operations not supported on
+root catalog"*) — the Data Catalog only supports tags down to the **database**
+level. This solution covers `database`, `crawler`, `job`, `trigger`, `workflow`,
+and `session`; the rest are one line each in `_GLUE_RESOURCES` should you need
+them.
+
+No Glue `Create*` API returns an ARN — most return an empty body and the rest
+return just a name — so the ARN is rebuilt from the event's account and region,
+the same way SNS and SQS are handled.
+
+**Tagging a Data Catalog ARN needs a read grant too.** Tagging a Glue *database*
+makes the service run an internal existence check, so `glue:TagResource` alone
+fails with `AccessDeniedException: not authorized to perform: glue:GetDatabase on
+resource: arn:aws:glue:…:catalog`. The role therefore also carries
+`glue:GetDatabase`, which returns database metadata only. `crawler`, `job`,
+`trigger`, `workflow`, and `session` need nothing beyond `glue:TagResource`.
+
+Every Glue type above and all three Athena types were verified end-to-end in
+`us-east-1`: each resource was created untagged, and the tags configured at
+deploy time appeared on it without any further action.
+
+> **Why Glue connections are out of scope.** A connection's existence check needs
+> `glue:GetConnection`, and `GetConnection` with `HidePassword=false` returns the
+> connection's **plaintext `PASSWORD` property**. Granting that to a tagging role
+> would let it read JDBC credentials, which contradicts the "tag-write plus
+> non-secret reads only" scope this sample claims (THREAT_MODEL.md T1). A
+> connection is unbilled configuration, so the trade is not worth it. If you
+> accept the risk, add `CreateConnection` back to `_GLUE_RESOURCES`, the
+> EventBridge rule, and the role.
+
+> **Watch the casing:** Athena emits `CreateWork`**`G`**`roup` while Redshift
+> Serverless emits `CreateWorkgroup`. EventBridge matches `eventName` exactly, so
+> the two rules never cross over — do not "normalize" either spelling.
+
+> Glue's tag API is the odd one out twice over: the parameter is `ResourceArn`
+> with a **`TagsToAdd` map**, not a `Tags` list. Athena uses `ResourceARN`
+> (all-caps) with an upper-case `[{Key, Value}]` list, like Managed Service for
+> Apache Flink.
 
 ## Redshift Serverless: one event source, two paths
 
@@ -164,8 +222,14 @@ domains created via either the new or legacy API are tagged.
 
 1. Ensure CDK is installed
 ```
-$ npm install -g aws-cdk
+$ sudo npm install -g aws-cdk
 ```
+
+A global install writes into a root-owned prefix such as
+`/usr/lib/node_modules`, so without `sudo` this usually fails with
+`EACCES: permission denied`. If you would rather not install anything globally,
+skip this step and prefix the `cdk` commands below with `npx` (`npx cdk synth`,
+`npx cdk deploy …`) — `npx` fetches the CLI on demand and needs no elevation.
 
 2. Create a Python virtual environment
 ```

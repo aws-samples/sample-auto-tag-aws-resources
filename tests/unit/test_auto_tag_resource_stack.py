@@ -288,5 +288,107 @@ def test_cloudtrail_rules_ignore_failed_api_calls():
         cloudtrail_rules += 1
         assert detail.get("errorCode") == [{"exists": False}], \
             f"rule with sources {pattern.get('source')} accepts failed calls"
-    # generic + opensearch + elasticache + kinesis + redshift + rs-serverless
-    assert cloudtrail_rules == 6
+    # generic + glue/athena + opensearch + elasticache + kinesis + redshift
+    # + rs-serverless
+    assert cloudtrail_rules == 7
+
+
+def _generic_rule(template):
+    rules = template.find_resources("AWS::Events::Rule")
+    return [r for r in rules.values()
+            if "aws.ec2" in r["Properties"].get("EventPattern", {}).get("source", [])][0]
+
+
+def _glue_athena_rule(template):
+    rules = template.find_resources("AWS::Events::Rule")
+    return [r for r in rules.values()
+            if "aws.glue" in r["Properties"].get("EventPattern", {}).get("source", [])][0]
+
+
+def test_glue_and_athena_have_their_own_rule():
+    """Glue and Athena tag immediately (same Lambda as the generic rule) but need
+    a separate rule: the generic rule's flat eventName list carries DynamoDB's
+    CreateTable, and Glue emits CreateTable per crawler-discovered table for a
+    resource that is not taggable at all."""
+    template = _build_template()
+    pattern = _glue_athena_rule(template)["Properties"]["EventPattern"]
+    assert sorted(pattern["source"]) == ["aws.athena", "aws.glue"]
+    assert sorted(pattern["detail"]["eventSource"]) == [
+        "athena.amazonaws.com", "glue.amazonaws.com"]
+    for name in ("CreateDatabase", "CreateCrawler", "CreateJob", "CreateTrigger",
+                 "CreateWorkflow", "CreateSession",
+                 "CreateWorkGroup", "CreateDataCatalog", "CreateCapacityReservation"):
+        assert name in pattern["detail"]["eventName"]
+
+
+def test_glue_athena_rule_excludes_untaggable_glue_tables():
+    """A Glue table cannot be tagged (glue:TagResource returns
+    InvalidInputException for a table ARN), so CreateTable must not be on this
+    rule -- otherwise every crawler-discovered table invokes the Lambda to no-op."""
+    template = _build_template()
+    pattern = _glue_athena_rule(template)["Properties"]["EventPattern"]
+    assert "CreateTable" not in pattern["detail"]["eventName"]
+
+
+def test_glue_athena_rule_excludes_connections():
+    """Connections are out of scope because their tag path needs
+    glue:GetConnection, which can return a plaintext JDBC password."""
+    template = _build_template()
+    pattern = _glue_athena_rule(template)["Properties"]["EventPattern"]
+    assert "CreateConnection" not in pattern["detail"]["eventName"]
+
+
+def test_generic_role_can_read_glue_databases_but_not_connections():
+    """Tagging a Data Catalog database ARN makes Glue run an internal existence
+    check that fails with AccessDenied unless glue:GetDatabase is granted
+    (confirmed end-to-end in us-east-1). glue:GetConnection must NOT be granted:
+    it can return a connection's plaintext PASSWORD, which would break the
+    "tag-write plus non-secret reads only" scope in THREAT_MODEL.md T1."""
+    template = _build_template()
+    policies = template.find_resources("AWS::IAM::Policy")
+    actions = set()
+    for policy in policies.values():
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]:
+            action = stmt.get("Action", [])
+            actions.update(action if isinstance(action, list) else [action])
+    assert "glue:GetDatabase" in actions
+    assert "glue:GetConnection" not in actions
+    # No broader Data Catalog reads leaked in alongside it.
+    assert "glue:GetTable" not in actions
+    assert "glue:GetTables" not in actions
+
+
+def test_generic_rule_does_not_target_glue_or_athena():
+    """Both ride their own rule; leaving them on the generic rule would re-admit
+    the Glue CreateTable overlap with DynamoDB."""
+    template = _build_template()
+    sources = _generic_rule(template)["Properties"]["EventPattern"]["source"]
+    assert "aws.glue" not in sources
+    assert "aws.athena" not in sources
+
+
+def test_athena_workgroup_event_name_does_not_collide_with_redshift_serverless():
+    """Athena emits CreateWork*G*roup and Redshift Serverless CreateWorkgroup.
+    EventBridge matches eventName exactly, so each rule must carry only its own
+    spelling."""
+    template = _build_template()
+    glue_athena = _glue_athena_rule(template)["Properties"]["EventPattern"]
+    assert "CreateWorkGroup" in glue_athena["detail"]["eventName"]
+    assert "CreateWorkgroup" not in glue_athena["detail"]["eventName"]
+
+    rules = template.find_resources("AWS::Events::Rule")
+    rss = [r for r in rules.values()
+           if r["Properties"].get("EventPattern", {}).get("source") == ["aws.redshift-serverless"]][0]
+    assert rss["Properties"]["EventPattern"]["detail"]["eventName"] == ["CreateWorkgroup"]
+
+
+def test_generic_role_grants_glue_and_athena_tag_actions():
+    template = _build_template()
+    policies = template.find_resources("AWS::IAM::Policy")
+    actions = set()
+    for policy in policies.values():
+        for stmt in policy["Properties"]["PolicyDocument"]["Statement"]:
+            action = stmt.get("Action", [])
+            actions.update(action if isinstance(action, list) else [action])
+    assert "glue:TagResource" in actions
+    assert "athena:TagResource" in actions

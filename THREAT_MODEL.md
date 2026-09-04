@@ -14,7 +14,9 @@ account/region where it is deployed. Three trigger paths:
    CloudTrail `Create*` events for EC2, S3, Lambda, DynamoDB, ELB, EFS, SQS,
    SNS, KMS, GameLift, CloudWatch Logs, MSK, EKS, ECS (cluster + service),
    Managed Service for Apache Flink, and Redshift Serverless namespaces →
-   invokes a Lambda that tags the resource immediately.
+   invokes a Lambda that tags the resource immediately. Glue (`aws.glue`) and
+   Athena (`aws.athena`) reach the **same** Lambda via a second rule, kept
+   separate only so Glue's untaggable `CreateTable` events never invoke it.
 2. **Polling tagging (slow to provision)** — EventBridge matches OpenSearch
    (`aws.es`), ElastiCache (`aws.elasticache`), Kinesis Data Streams
    (`aws.kinesis`), Redshift (`aws.redshift`), and Redshift Serverless
@@ -62,7 +64,8 @@ CloudTrail / RDS service events (AWS-internal, trusted)
 
 | # | Threat (STRIDE) | Mitigation |
 |---|---|---|
-| T1 | **Elevation / over-broad IAM** — Lambda roles use `resources=["*"]` | **Inherent & justified**: the automation must tag resources whose ARNs are unknown at deploy time (any future resource). Actions are scoped to **tag-write + read-only `Describe*`/`Get*Tagging`/`List*Tags` only** — no create/delete/modify of data or infra, and (after T8) no tag-removal. The granted action set is exactly what the handler code exercises. Each trigger path has its **own least-privilege role** (generic / RDS / OpenSearch / ElastiCache / Kinesis / Redshift / Redshift Serverless split), so a fault in one path cannot tag-API another service set. |
+| T1 | **Elevation / over-broad IAM** — Lambda roles use `resources=["*"]` | **Inherent & justified**: the automation must tag resources whose ARNs are unknown at deploy time (any future resource). Actions are scoped to **tag-write + read-only `Describe*`/`Get*Tagging`/`List*Tags` only** — no create/delete/modify of data or infra, and (after T8) no tag-removal. The granted action set is exactly what the handler code exercises. Each trigger path has its **own least-privilege role** (generic / RDS / OpenSearch / ElastiCache / Kinesis / Redshift / Redshift Serverless split), so a fault in one path cannot tag-API another service set. The Glue and Athena grants are `glue:TagResource`, `athena:TagResource`, plus the one read Glue's own tag path forces (`glue:GetDatabase`, metadata only) — no `GetTable*`/`Search*`, so the role cannot read table schemas or query metadata. |
+| T9 | **Credential disclosure via Glue connection tagging** — tagging a `connection` ARN makes Glue run an internal existence check that requires `glue:GetConnection`, and `GetConnection` with `HidePassword=false` returns the connection's **plaintext `PASSWORD`** property. Granting it would give the tagging role read access to JDBC credentials. | **Avoided by scope.** Glue connections are excluded from `_GLUE_RESOURCES` and from the `glue-athena-tagging-rule` event pattern, so the role never needs `glue:GetConnection` and it is not granted. A connection is unbilled configuration, so nothing cost-allocation-relevant is lost. Regression-tested (`test_generic_role_can_read_glue_databases_but_not_connections`). The one read that *is* granted, `glue:GetDatabase`, returns database metadata (name, description, S3 location URI) and no secrets. |
 | T2 | **Wildcard action** `resource-groups:*` in the generic role | **Remediation: removed.** The code only calls `resourcegroupstaggingapi.tag_resources` (= `tag:TagResources`, already granted). The unused `resource-groups:*` wildcard was deleted. |
 | T3 | **Tampering via spoofed events** | EventBridge rules match only AWS-native `source`/`detail-type`/`eventName`; events are produced by CloudTrail/RDS, not externally injectable. No public ingress. |
 | T4 | **Info disclosure via identity recording** | Off by default (`identityRecording=false`). When on, it records only principal IDs (`userId`/`roleId`) as tags — no credentials/secrets. Documented in README. |

@@ -238,6 +238,88 @@ def aws_kinesisanalytics(event):
             arnList.append(arn)
     return arnList
 
+# Glue resource types this handler tags, keyed by CloudTrail eventName. Each
+# entry is (ARN resource type, name extractor). No Glue Create* API returns an
+# ARN -- most return an empty body and the rest return just a name -- so the ARN
+# is rebuilt from the event's account/region, like SNS/SQS above.
+#
+# Glue *tables* are deliberately absent: glue:TagResource rejects a
+# table/<database>/<table> ARN with InvalidInputException (verified against
+# us-east-1), as it does tableVersion, userDefinedFunction, and the root
+# catalog ("Tag operations not supported on root catalog"). The Data Catalog
+# only supports tags down to the database level.
+#
+# Glue *connections* are also deliberately absent, for a security reason rather
+# than an API one: tagging a connection ARN makes Glue perform an internal
+# existence check that requires glue:GetConnection, and GetConnection with
+# HidePassword=false returns the connection's plaintext PASSWORD property.
+# Granting that to a tagging role would let it read JDBC credentials, which
+# contradicts the "tag-write plus non-secret reads only" scope in
+# THREAT_MODEL.md T1. A connection is unbilled config, so it is not worth it.
+#
+# Taggable Glue types not covered here, should anyone need them: devEndpoint,
+# mlTransform, registry, schema, blueprint, dataQualityRuleset.
+_GLUE_RESOURCES = {
+    "CreateDatabase":   ("database",
+                         lambda req, res: (req.get('databaseInput') or {}).get('name')),
+    "CreateCrawler":    ("crawler",
+                         lambda req, res: req.get('name')),
+    "CreateJob":        ("job",
+                         lambda req, res: res.get('name') or req.get('name')),
+    "CreateTrigger":    ("trigger",
+                         lambda req, res: res.get('name') or req.get('name')),
+    "CreateWorkflow":   ("workflow",
+                         lambda req, res: res.get('name') or req.get('name')),
+    "CreateSession":    ("session",
+                         lambda req, res: (res.get('session') or {}).get('id') or req.get('id')),
+}
+
+
+def aws_glue(event):
+    """AWS Glue. Every resource here is a Data Catalog / orchestration object
+    that exists as soon as its Create* call returns, so it is taggable
+    immediately -- no polling needed."""
+    arnList = []
+    entry = _GLUE_RESOURCES.get(event['detail']['eventName'])
+    if entry is None:
+        return arnList
+    resourceType, extract = entry
+    name = extract(event['detail'].get('requestParameters') or {},
+                   event['detail'].get('responseElements') or {})
+    if name:
+        print("tagging for new Glue " + resourceType + "...")
+        arnList.append('arn:aws:glue:{}:{}:{}/{}'.format(
+            event['region'], event['account'], resourceType, name))
+    return arnList
+
+
+# Athena's three taggable resource types. All are created synchronously and
+# named by requestParameters.name.
+#
+# Note the casing: Athena's event is CreateWork*G*roup, while Redshift
+# Serverless emits CreateWorkgroup. EventBridge matches eventName exactly, so
+# the two never collide -- do not "normalize" either spelling.
+_ATHENA_RESOURCES = {
+    "CreateWorkGroup": "workgroup",
+    "CreateDataCatalog": "datacatalog",
+    "CreateCapacityReservation": "capacity-reservation",
+}
+
+
+def aws_athena(event):
+    """Amazon Athena workgroups, data catalogs, and capacity reservations."""
+    arnList = []
+    resourceType = _ATHENA_RESOURCES.get(event['detail']['eventName'])
+    if resourceType is None:
+        return arnList
+    name = (event['detail'].get('requestParameters') or {}).get('name')
+    if name:
+        print("tagging for new Athena " + resourceType + "...")
+        arnList.append('arn:aws:athena:{}:{}:{}/{}'.format(
+            event['region'], event['account'], resourceType, name))
+    return arnList
+
+
 def aws_redshift_serverless(event):
     """Redshift Serverless *namespace* only. A namespace is AVAILABLE as soon as
     CreateNamespace returns (it has no CREATING state), so it is tagged here. A
@@ -272,6 +354,8 @@ _SOURCE_HANDLERS = {
     "aws.eks": aws_eks,
     "aws.ecs": aws_ecs,
     "aws.kinesisanalytics": aws_kinesisanalytics,
+    "aws.glue": aws_glue,
+    "aws.athena": aws_athena,
     "aws.redshift-serverless": aws_redshift_serverless,
 }
 
@@ -365,6 +449,30 @@ def _tag_kinesisanalytics(arn_list, res_tags, event):
             _MSF_RETRY_CODES)
 
 
+def _tag_glue(arn_list, res_tags, event):
+    """Glue TagResource is the odd one out twice over: the tag parameter is named
+    TagsToAdd (not Tags) and it takes a {key: value} map.
+
+    Note for whoever extends _GLUE_RESOURCES: tagging a Data Catalog ARN makes
+    Glue run an existence check under the hood that needs a matching read grant
+    (a database needs glue:GetDatabase). The crawler/job/trigger/workflow/session
+    ARNs need nothing beyond glue:TagResource."""
+    client = boto3.client('glue')
+    tags = {str(key): str(value) for key, value in res_tags.items()}
+    for arn in arn_list:
+        client.tag_resource(ResourceArn=arn, TagsToAdd=tags)
+
+
+def _tag_athena(arn_list, res_tags, event):
+    """Athena TagResource takes ResourceARN (all-caps ARN, like MSF) and a list
+    of UPPER-case {Key, Value} objects."""
+    client = boto3.client('athena')
+    tags = [{'Key': str(key), 'Value': str(value)}
+            for key, value in res_tags.items()]
+    for arn in arn_list:
+        client.tag_resource(ResourceARN=arn, Tags=tags)
+
+
 def _tag_redshift_serverless(arn_list, res_tags, event):
     """Redshift Serverless TagResource takes camelCase params and a list of
     LOWER-case {key, value} objects. Note the Step Functions path (PART 7) uses
@@ -384,6 +492,8 @@ _NATIVE_TAGGERS = {
     "aws.eks": _tag_eks,
     "aws.ecs": _tag_ecs,
     "aws.kinesisanalytics": _tag_kinesisanalytics,
+    "aws.glue": _tag_glue,
+    "aws.athena": _tag_athena,
     "aws.redshift-serverless": _tag_redshift_serverless,
 }
 
